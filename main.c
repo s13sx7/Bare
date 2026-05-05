@@ -1,5 +1,6 @@
 #include <inttypes.h>
 #include <stdbool.h>
+#include <stddef.h>
 
 #define BIT(X) (1UL << (X))
 #define PIN(bank, num) ((((bank)-'A') << 8) | (num))
@@ -30,12 +31,11 @@
 #define GPIO_MODE_OUTPUT_50M_AFOPEND  0x0F  // CNF=11
 
 #define CORE_FREQ 72000000 // CORE FREQUENCY
+
 struct gpio {
     volatile uint32_t CRL, CRH, IDR, ODR, BSRR, LCKR;
     volatile uint16_t BRR;
 };
-
-
 #define GPIO(bank) ((struct gpio *) (0x40010800 + 0x400*(bank)))
 
 static inline void gpio_set_mode(uint16_t pin, uint8_t mode) {
@@ -67,6 +67,53 @@ struct systick{
 };
 #define SYSTICK ((struct systick *) 0xE000E010)
 
+struct usart{
+  volatile uint32_t SR, DR, BRR, CR1, CR2, CR3, GTPR;  
+};
+#define USART1 ((struct usart*) 0x40013800) // rcc reg: APB2ENR(14) PA9(TX) PA10(RX)
+#define USART2 ((struct usart*) 0x40004400)// rcc reg: APB1ENR(16)
+#define USART3 ((struct usart*) 0x40004800)// rcc reg: APB1ENR(17)
+
+static inline void spin(volatile uint32_t count) {
+  while (count--);
+}
+
+static inline void usart_init(struct usart *usart, unsigned long baud) {
+    uint16_t rx, tx;
+
+    if (usart == USART1) RCC->APB2ENR |= BIT(14);
+    if (usart == USART2) RCC->APB1ENR |= BIT(16);
+    if (usart == USART3) RCC->APB1ENR |= BIT(17);
+
+    if (usart == USART1) rx = PIN('A', 10), tx = PIN('A', 9);
+    if (usart == USART2) (void) 0; 
+    if (usart == USART3) (void) 0;
+    RCC->APB2ENR |= BIT(2); // GPIOAEN
+    gpio_set_mode(rx, GPIO_MODE_INPUT_PULL);
+    gpio_set_mode(tx, GPIO_MODE_OUTPUT_50M_AFPUSH);
+    
+    usart->CR1 = 0;
+    usart->CR1 |= BIT(13) | BIT(3) | BIT(2);
+    usart->BRR = CORE_FREQ / baud;
+}
+
+static inline int usart_read_ready(struct usart *usart) {
+  return usart->SR & BIT(5);  // If RXNE bit is set, data is ready
+}
+
+static inline uint8_t usart_read_byte(struct usart *usart){
+    return (uint8_t) (usart->DR & 255);
+}
+
+static inline void usart_write_byte(struct usart *usart, uint8_t byte) {
+    usart->DR = byte;
+    while ((usart->SR & BIT(7)) == 0) spin(1);
+}
+
+static inline void usart_write_buf(struct usart *usart, char *buf, size_t len) {
+  while (len-- > 0) usart_write_byte(usart, *(uint8_t *) buf++);
+}
+
 static inline void systick_init(uint32_t ticks) {
     if ((ticks - 1) > 0xffffff) return;
     SYSTICK->RVR = ticks - 1;
@@ -78,13 +125,6 @@ static inline void gpio_write(uint16_t pin, bool val){
     struct gpio *gpio = GPIO(PINBANK(pin));
     gpio->BSRR = (1U << PINNO(pin)) << (val ? 0 : 16);
 }
-
-
-#if 0
-static inline void spin(volatile uint32_t count) { // ПРИМИТИВНАЯ ЗАДЕРЖА
-  while (count--) (void) 0;
-}
-#endif
 
 static volatile uint32_t s_ticks; // volatile is important!!
 void SysTick_Handler(void) { // This is interupt handler for SysTick
@@ -105,21 +145,19 @@ bool timer_expired(uint32_t *t, uint32_t prd, uint32_t now) {
 int main(void){
     RCC->APB1ENR |= BIT(28);   // PWREN – включаем тактирование PWR
     PWR->CR |= BIT(8); // ЭТО ВСЁ ПОТОМУ ЧТО PC13 ПИН НЕ ТАКОЙ ПРОСТОЙ, ПОЧИТАЙ
-    uint16_t led = PIN('C',13);                                                         
+    uint16_t led = PIN('C',13);                
     RCC->APB2ENR |= BIT(4);
     gpio_set_mode(led, GPIO_MODE_OUTPUT_2M_GPPUSH);
-    systick_init((CORE_FREQ - 20000000)/ 1000);
+    systick_init(16000000/ 1000);
     uint32_t timer, period = 500;
+    //usart_init(USART1, 115200);
     for(;;){
         if (timer_expired(&timer, period, s_ticks)){
             static bool on;
             gpio_write(led, on);
             on = !on;
+            //usart_write_buf(USART1, "hi\r\n", 4); 
         }
-        //gpio_write(led, false);
-        //spin(999999);
-        //gpio_write(led, true);
-        //spin(999999);
     }
     return 0;
 }
@@ -130,9 +168,6 @@ __attribute__((naked, noreturn)) void _reset(void) {
   extern long _sbss, _ebss, _sdata, _edata, _sidata;
   for (long *dst = &_sbss; dst < &_ebss; dst++) *dst = 0;
   for (long *dst = &_sdata, *src = &_sidata; dst < &_edata;) *dst++ = *src++;
-  
-  main(); //Call main()
-  for (;;) (void) 0;  // Infinite loop
 }
 
 extern void _estack(void);  // Defined in xx.ld
